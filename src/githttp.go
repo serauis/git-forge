@@ -618,7 +618,7 @@ func (s *Server) handleReceivePack(w http.ResponseWriter, req *http.Request, own
 		http.Error(w, "unreadable body", http.StatusBadRequest)
 		return
 	}
-	s.store.mu.Lock()
+	s.store.lockWrite()
 	defer s.store.mu.Unlock()
 	repo := s.store.repo(owner, repoName)
 	if repo == nil {

@@ -255,7 +255,7 @@ func (s *Server) mcpToolsCall(w http.ResponseWriter, rpc rpcRequest, write func(
 			}
 		}
 	}
-	s.store.mu.Lock()
+	s.store.lockWrite()
 	defer s.store.mu.Unlock()
 	write(rpcResponse{Result: s.runTool(tool.Name, args)})
 }

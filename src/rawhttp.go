@@ -32,8 +32,12 @@ import (
 
 const maxRawHeaderBytes = 64 << 10
 
-// serveListener accepts on ln forever: simple requests are served by the
-// raw path, the rest are replayed into the fallback http.Server.
+// serveListener accepts on ln forever: modelled requests are served by
+// the epoll reactor (rawhttp2.go), the rest are replayed into the
+// fallback http.Server. When the reactor cannot be created, the
+// goroutine-per-connection raw path below serves instead — the two
+// paths share the parser, the handlers and the fallback, and produce
+// byte-identical responses.
 func (s *Server) serveListener(ln net.Listener) error {
 	fallback := &chanListener{ch: make(chan net.Conn, 16), addr: ln.Addr()}
 	std := &http.Server{Handler: s}
@@ -74,8 +78,15 @@ func (c *replayConn) Read(b []byte) (int, error) { return c.r.Read(b) }
 func (s *Server) serveConn(conn net.Conn, fallback *chanListener) {
 	br := bufio.NewReaderSize(conn, 8192)
 	remoteAddr := conn.RemoteAddr().String()
+	// per-connection scratch: the header block is rebuilt for every
+	// request on the connection; reusing the buffer keeps it off the
+	// allocator's hot path. A block handed to the fallback server is
+	// never reused (serveConn returns immediately after the hand-off).
+	var hdrBuf []byte
 	for {
-		hdr, err := readHeaderBlock(br)
+		var hdr []byte
+		var err error
+		hdr, hdrBuf, err = readHeaderBlock(br, hdrBuf)
 		if err != nil {
 			conn.Close()
 			return
@@ -189,82 +200,125 @@ func parseIssueURI(uri string) (owner, repo string, number int, ok bool) {
 	return owner, repo, n, true
 }
 
+// fastEntry is the fast path's one-entry cache: the repo and issue the
+// last served read named, plus the store epoch at validation time. A
+// hit is served lock-free only when the epoch is unchanged (no writer
+// has taken the store since) AND the issue's body fingerprint still
+// matches its memo — the same check the locked path performs. Any
+// mutation anywhere takes the write lock first (bumping the epoch), so
+// a state that changed under the cache can never validate.
+type fastEntry struct {
+	uri   string
+	epoch int64
+	repo  *Repo
+	iss   *Issue
+}
+
+// fastIssueBufs returns the fast path's response (head + memoised
+// body) when the request can be served from the header block, in the
+// exact bytes the full handler stack produces. ok=false means the
+// normal path should take over.
+func (s *Server) fastIssueBufs(rq *rawRequest) ([][]byte, bool) {
+	if rq.protoMinor != 1 || strings.IndexByte(rq.uri, '?') >= 0 {
+		return nil, false
+	}
+	if s.token != "" {
+		auth := rq.headers["Authorization"]
+		if len(auth) != 1 || auth[0] != "Bearer "+s.token {
+			return nil, false
+		}
+	}
+	var body []byte
+	if e := s.fastCache.Load(); e != nil && e.uri == rq.uri &&
+		e.epoch == s.store.epoch.Load() {
+		// lock-free hit candidate: revalidate against the issue's own
+		// fingerprint, then confirm the epoch did not move while we
+		// looked (a writer bumps it before mutating).
+		if iss := e.iss; iss.bodyCache != nil &&
+			iss.bodyCacheKey == issueBodyKey(e.repo, iss) &&
+			s.store.epoch.Load() == e.epoch {
+			body = iss.bodyCache
+		}
+	}
+	if body == nil {
+		owner, repoName, number, ok := parseIssueURI(rq.uri)
+		if !ok {
+			return nil, false
+		}
+		s.store.mu.RLock()
+		r := s.store.repo(owner, repoName)
+		if r != nil {
+			if iss := r.Issues[number]; iss != nil && iss.bodyCache != nil &&
+				iss.bodyCacheKey == issueBodyKey(r, iss) {
+				body = iss.bodyCache
+				s.fastCache.Store(&fastEntry{
+					uri: rq.uri, epoch: s.store.epoch.Load(), repo: r, iss: iss,
+				})
+			}
+		}
+		s.store.mu.RUnlock()
+	}
+	if body == nil {
+		return nil, false
+	}
+	head := make([]byte, 0, 192)
+	head = append(head, "HTTP/1.1 200 OK\r\n"...)
+	head = append(head, "Content-Type: application/json; charset=utf-8\r\n"...)
+	// the canonical key the normal path's http.Header.Set produces
+	head = append(head, "X-Github-Request-Id: "...)
+	head = append(head, s.store.requestID()...)
+	head = append(head, "\r\n"...)
+	head = append(head, "Date: "...)
+	head = append(head, cachedDate()...)
+	head = append(head, "\r\n"...)
+	head = append(head, "Content-Length: "...)
+	head = strconv.AppendInt(head, int64(len(body)), 10)
+	head = append(head, "\r\n"...)
+	if rq.closeAfter {
+		head = append(head, "Connection: close\r\n"...)
+	}
+	head = append(head, "\r\n"...)
+	return [][]byte{head, body}, true
+}
+
 // tryFastIssue serves the request from the header block when it can.
 // handled=false means the normal path should take over (nothing was
 // written); when handled=true the response is fully written and err is
 // its write result.
 func (s *Server) tryFastIssue(conn net.Conn, rq *rawRequest) (bool, error) {
-	if rq.protoMinor != 1 || strings.IndexByte(rq.uri, '?') >= 0 {
-		return false, nil
-	}
-	if s.token != "" {
-		auth := rq.headers["Authorization"]
-		if len(auth) != 1 || auth[0] != "Bearer "+s.token {
-			return false, nil
-		}
-	}
-	owner, repoName, number, ok := parseIssueURI(rq.uri)
+	bufs, ok := s.fastIssueBufs(rq)
 	if !ok {
 		return false, nil
 	}
-	s.store.mu.RLock()
-	r := s.store.repo(owner, repoName)
-	var body []byte
-	if r != nil {
-		if iss := r.Issues[number]; iss != nil && iss.bodyCache != nil &&
-			iss.bodyCacheKey == issueBodyKey(r, iss) {
-			body = iss.bodyCache
-		}
-	}
-	s.store.mu.RUnlock()
-	if body == nil {
-		return false, nil
-	}
-	var head bytes.Buffer
-	head.Grow(192)
-	head.WriteString("HTTP/1.1 200 OK\r\n")
-	head.WriteString("Content-Type: application/json; charset=utf-8\r\n")
-	// the canonical key the normal path's http.Header.Set produces
-	head.WriteString("X-Github-Request-Id: ")
-	head.WriteString(s.store.requestID())
-	head.WriteString("\r\n")
-	head.WriteString("Date: ")
-	head.WriteString(cachedDate())
-	head.WriteString("\r\n")
-	head.WriteString("Content-Length: ")
-	head.WriteString(strconv.Itoa(len(body)))
-	head.WriteString("\r\n")
-	if rq.closeAfter {
-		head.WriteString("Connection: close\r\n")
-	}
-	head.WriteString("\r\n")
-	bufs := net.Buffers{head.Bytes(), body}
-	_, err := bufs.WriteTo(conn)
+	nb := net.Buffers(bufs)
+	_, err := nb.WriteTo(conn)
 	return true, err
 }
 
 // readHeaderBlock reads one header block (request line + headers + the
-// terminating blank line). It returns an error on EOF, an over-long line
-// or an oversized block; the caller then closes or falls back.
-func readHeaderBlock(br *bufio.Reader) ([]byte, error) {
-	var buf bytes.Buffer
+// terminating blank line) into the caller's reusable buffer, returning
+// the block and the buffer to reuse for the next block. It returns an
+// error on EOF, an over-long line or an oversized block; the caller
+// then closes or falls back.
+func readHeaderBlock(br *bufio.Reader, buf []byte) ([]byte, []byte, error) {
+	buf = buf[:0]
 	for {
 		line, err := br.ReadSlice('\n')
-		buf.Write(line)
-		if buf.Len() > maxRawHeaderBytes {
-			return nil, io.ErrUnexpectedEOF
+		buf = append(buf, line...)
+		if len(buf) > maxRawHeaderBytes {
+			return nil, buf, io.ErrUnexpectedEOF
 		}
 		if err == bufio.ErrBufferFull {
 			continue
 		}
 		if err != nil {
-			return nil, err
+			return nil, buf, err
 		}
 		if len(line) == 2 && line[0] == '\r' && line[1] == '\n' {
-			return buf.Bytes(), nil
+			return buf, buf, nil
 		}
 		if len(line) == 1 && line[0] == '\n' {
-			return buf.Bytes(), nil
+			return buf, buf, nil
 		}
 	}
 }
@@ -523,7 +577,9 @@ func cachedDate() string {
 	return s
 }
 
-func writeRawResponse(conn net.Conn, rq *rawRequest, cw *captureWriter) error {
+// responseChunks serialises a captured response into writev chunks:
+// the head block followed by the handler's own body slices, uncopied.
+func responseChunks(rq *rawRequest, cw *captureWriter) [][]byte {
 	bodyLen := cw.bodyLen
 	status := cw.status
 	suppressBody := rq.method == "HEAD" || status == 204 || status == 304
@@ -587,13 +643,17 @@ func writeRawResponse(conn net.Conn, rq *rawRequest, cw *captureWriter) error {
 	}
 	out.WriteString("\r\n")
 	if suppressBody || len(cw.chunks) == 0 {
-		_, err := conn.Write(out.Bytes())
-		return err
+		return [][]byte{out.Bytes()}
 	}
-	// headers + the handler's own body slices in one writev: no copies.
-	bufs := make(net.Buffers, 0, len(cw.chunks)+1)
-	bufs = append(bufs, out.Bytes())
-	bufs = append(bufs, cw.chunks...)
+	// headers + the handler's own body slices: no copies.
+	chunks := make([][]byte, 0, len(cw.chunks)+1)
+	chunks = append(chunks, out.Bytes())
+	chunks = append(chunks, cw.chunks...)
+	return chunks
+}
+
+func writeRawResponse(conn net.Conn, rq *rawRequest, cw *captureWriter) error {
+	bufs := net.Buffers(responseChunks(rq, cw))
 	_, err := bufs.WriteTo(conn)
 	return err
 }

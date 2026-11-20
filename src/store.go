@@ -111,6 +111,17 @@ type Store struct {
 	commentSeq int64
 	clock      int64 // logical seconds since clockBase
 	reqSeq     int64
+	// epoch counts write-lock acquisitions; every mutation of store
+	// state happens under the write lock, so an unchanged epoch means
+	// the state a lock-free reader validated is still current.
+	epoch atomic.Int64
+}
+
+// lockWrite takes the store write lock and records the acquisition in
+// the mutation epoch before the caller changes anything.
+func (s *Store) lockWrite() {
+	s.mu.Lock()
+	s.epoch.Add(1)
 }
 
 func newStore() *Store {

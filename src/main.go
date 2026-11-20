@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -25,6 +26,10 @@ import (
 type Server struct {
 	store *Store
 	token string
+	// fastCache memoises the last issue read the raw fast path served,
+	// validated lock-free against the store's mutation epoch and the
+	// issue's own body fingerprint (see tryFastIssue).
+	fastCache atomic.Pointer[fastEntry]
 }
 
 func readAllBody(req *http.Request) ([]byte, error) {
@@ -132,7 +137,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	case path == "/mcp":
 		s.handleMCP(w, req)
 	case path == "/api/graphql":
-		s.store.mu.Lock()
+		s.store.lockWrite()
 		s.handleGraphQL(w, req)
 		s.store.mu.Unlock()
 	case strings.HasPrefix(path, "/api/v3"):
@@ -173,7 +178,7 @@ func (s *Server) serveREST(w http.ResponseWriter, req *http.Request) {
 		s.store.mu.RLock()
 		defer s.store.mu.RUnlock()
 	} else {
-		s.store.mu.Lock()
+		s.store.lockWrite()
 		defer s.store.mu.Unlock()
 	}
 	rest := strings.TrimPrefix(req.URL.Path, "/api/v3")
