@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // ---------------------------------------------------------------------------
@@ -25,7 +26,12 @@ type Object struct {
 
 func hashObject(typ string, data []byte) string {
 	h := sha1.New()
-	fmt.Fprintf(h, "%s %d\x00", typ, len(data))
+	var hdr [24]byte
+	n := copy(hdr[:], typ)
+	hdr[n] = ' '
+	head := strconv.AppendInt(hdr[:n+1], int64(len(data)), 10)
+	head = append(head, 0)
+	h.Write(head)
 	h.Write(data)
 	return hex.EncodeToString(h.Sum(nil))
 }
@@ -588,6 +594,36 @@ func planFetch(store map[string]*Object, wants, haves, clientShallow []string, d
 // packfiles
 // ---------------------------------------------------------------------------
 
+// zlib streams are created per pack entry; pooling the reader/writer
+// state avoids re-initialising the flate machinery (huffman tables,
+// window buffers) for every object.
+var zlibReaders sync.Pool
+var zlibWriters sync.Pool
+
+type zlibResetter interface{ Reset(io.Reader, []byte) error }
+
+func acquireZlibReader(r io.Reader) (io.ReadCloser, error) {
+	if v := zlibReaders.Get(); v != nil {
+		zr := v.(io.ReadCloser)
+		if rs, ok := zr.(zlibResetter); ok {
+			if err := rs.Reset(r, nil); err == nil {
+				return zr, nil
+			}
+		}
+	}
+	return zlib.NewReader(r)
+}
+
+func acquireZlibWriter(w io.Writer) *zlib.Writer {
+	if v := zlibWriters.Get(); v != nil {
+		zw := v.(*zlib.Writer)
+		zw.Reset(w)
+		return zw
+	}
+	zw, _ := zlib.NewWriterLevel(w, zlib.DefaultCompression)
+	return zw
+}
+
 // writePack serialises the given objects (sorted for determinism) as a
 // version-2 pack with no deltas.
 func writePack(store map[string]*Object, oids map[string]bool) []byte {
@@ -606,9 +642,10 @@ func writePack(store map[string]*Object, oids map[string]bool) []byte {
 	for _, oid := range list {
 		obj := store[oid]
 		writePackObjectHeader(&buf, typeCode[obj.Type], len(obj.Data))
-		zw, _ := zlib.NewWriterLevel(&buf, zlib.DefaultCompression)
+		zw := acquireZlibWriter(&buf)
 		zw.Write(obj.Data)
 		zw.Close()
+		zlibWriters.Put(zw)
 	}
 	sum := sha1.Sum(buf.Bytes())
 	buf.Write(sum[:])
@@ -705,15 +742,21 @@ func readPack(data []byte, into map[string]*Object, resolveBase func(oid string)
 		// inflate exactly this entry's zlib stream: a bytes.Reader is an
 		// io.ByteReader, so zlib consumes precisely the stream's bytes.
 		br := bytes.NewReader(body[pos:])
-		zr, err := zlib.NewReader(br)
+		zr, err := acquireZlibReader(br)
 		if err != nil {
 			return nil, fmt.Errorf("zlib: %w", err)
 		}
-		payload, err := io.ReadAll(zr)
-		zr.Close()
+		var pb bytes.Buffer
+		if size > 0 && size <= 1<<28 {
+			pb.Grow(size) // the entry header declares the inflated size
+		}
+		_, err = io.Copy(&pb, zr)
 		if err != nil {
+			zr.Close()
 			return nil, fmt.Errorf("inflate: %w", err)
 		}
+		zlibReaders.Put(zr)
+		payload := pb.Bytes()
 		consumed := len(body[pos:]) - br.Len()
 		pos += consumed
 		if len(payload) != size {

@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strconv"
@@ -75,11 +77,12 @@ func issueJSON(r *Repo, iss *Issue) issueView {
 		c := formatTime(iss.ClosedAt)
 		closed = &c
 	}
+	ts := formatTime(iss.CreatedAt)
 	return issueView{
 		ID: iss.GID, Number: iss.Number, Title: iss.Title, Body: iss.Body,
 		State: iss.State, Labels: labels, User: viewerView(),
-		Comments: len(iss.Comments), CreatedAt: formatTime(iss.CreatedAt),
-		UpdatedAt: formatTime(iss.CreatedAt), ClosedAt: closed,
+		Comments: len(iss.Comments), CreatedAt: ts,
+		UpdatedAt: ts, ClosedAt: closed,
 	}
 }
 
@@ -92,8 +95,9 @@ type commentView struct {
 }
 
 func commentJSON(c *Comment) commentView {
+	ts := formatTime(c.CreatedAt)
 	return commentView{ID: c.ID, Body: c.Body, User: viewerView(),
-		CreatedAt: formatTime(c.CreatedAt), UpdatedAt: formatTime(c.CreatedAt)}
+		CreatedAt: ts, UpdatedAt: ts}
 }
 
 type refView struct {
@@ -136,6 +140,7 @@ func pullJSON(r *Repo, p *Pull) pullView {
 		m := formatTime(p.MergedAt)
 		mergedAt = &m
 	}
+	pts := formatTime(p.CreatedAt)
 	return pullView{
 		ID: p.GID, Number: p.Number, State: p.State, Title: p.Title, Body: p.Body,
 		Head:           refView{Label: r.Owner + ":" + p.Head, Ref: p.Head, Sha: headSha},
@@ -144,7 +149,7 @@ func pullJSON(r *Repo, p *Pull) pullView {
 		MergeCommitSha: mergeSha,
 		MergedAt:       mergedAt,
 		User:           viewerView(),
-		CreatedAt:      formatTime(p.CreatedAt), UpdatedAt: formatTime(p.CreatedAt),
+		CreatedAt:      pts, UpdatedAt: pts,
 	}
 }
 
@@ -846,15 +851,74 @@ func (s *Server) createIssue(r *Repo, title, body string, labels []string) (*Iss
 	return iss, ""
 }
 
+// decodeBodyBytes is decodeBody over an in-memory body.
+func decodeBodyBytes(data []byte) (jsonBody, bool) {
+	out := jsonBody{}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	var raw map[string]interface{}
+	if err := dec.Decode(&raw); err != nil {
+		return nil, false
+	}
+	if raw != nil {
+		out = raw
+	}
+	return out, true
+}
+
+type issueCreateBody struct {
+	Title  string   `json:"title"`
+	Body   string   `json:"body"`
+	Labels []string `json:"labels"`
+}
+
+// createIssueFields extracts the fields restCreateIssue needs. The
+// common case — a flat object whose keys are exactly the modelled ones
+// (case-sensitively; the probe map's keys are the decoded key strings,
+// so escapes and case variants are seen exactly as the generic decode
+// sees them) and whose values are correctly typed — decodes into a
+// struct. Anything else takes the generic map decode unchanged, so
+// error behaviour (400 vs 422, wrong-typed fields, stray keys) is
+// identical by construction.
+func createIssueFields(req *http.Request) (title, body string, labels []string, ok bool) {
+	if req.Body == nil {
+		return "", "", nil, true
+	}
+	data, err := io.ReadAll(req.Body)
+	if err != nil {
+		return "", "", nil, false
+	}
+	var probe map[string]json.RawMessage
+	if err := json.NewDecoder(bytes.NewReader(data)).Decode(&probe); err == nil && probe != nil {
+		keysOK := true
+		for k := range probe {
+			if k != "title" && k != "body" && k != "labels" {
+				keysOK = false
+				break
+			}
+		}
+		if keysOK {
+			var ib issueCreateBody
+			if err := json.NewDecoder(bytes.NewReader(data)).Decode(&ib); err == nil {
+				return ib.Title, ib.Body, ib.Labels, true
+			}
+		}
+	}
+	b, ok2 := decodeBodyBytes(data)
+	if !ok2 {
+		return "", "", nil, false
+	}
+	t, _ := b.str("title")
+	bt, _ := b.str("body")
+	return t, bt, b.strList("labels"), true
+}
+
 func (s *Server) restCreateIssue(w http.ResponseWriter, req *http.Request, r *Repo) {
-	body, ok := decodeBody(req)
+	title, bodyText, labels, ok := createIssueFields(req)
 	if !ok {
 		s.writeErr(w, 400, "Problems parsing JSON")
 		return
 	}
-	title, _ := body.str("title")
-	bodyText, _ := body.str("body")
-	iss, errMsg := s.createIssue(r, title, bodyText, body.strList("labels"))
+	iss, errMsg := s.createIssue(r, title, bodyText, labels)
 	if errMsg != "" {
 		s.writeErr(w, 422, errMsg)
 		return

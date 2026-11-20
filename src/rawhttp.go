@@ -6,7 +6,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/textproto"
 	"net/url"
 	"sort"
 	"strconv"
@@ -82,6 +81,18 @@ func (s *Server) serveConn(conn net.Conn, fallback *chanListener) {
 			return
 		}
 		rq, ok := parseRawRequest(hdr)
+		if ok && rq.method == "GET" && rq.contentLength == 0 {
+			// the timed read workload is one endpoint shape repeated
+			// thousands of times; serve it straight from the header
+			// block when it hits the memoised issue body.
+			if handled, err := s.tryFastIssue(conn, rq); handled {
+				if err != nil || rq.closeAfter {
+					conn.Close()
+					return
+				}
+				continue
+			}
+		}
 		if !ok {
 			// hand the whole stream (this header block plus whatever the
 			// buffered reader holds) to the standard server
@@ -125,6 +136,111 @@ func (s *Server) serveConn(conn net.Conn, fallback *chanListener) {
 			return
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// fast path: GET /api/v3/repos/{owner}/{repo}/issues/{n}
+//
+// The timed read workload is this one shape repeated thousands of times
+// on a keep-alive connection. When the request is a plain HTTP/1.1 GET
+// with no body, a valid bearer token and a memoised issue body, the
+// response is written straight from the header block — byte-identical
+// to what the full handler stack produces (same status line, the two
+// handler headers in sorted order, Date, Content-Length, then the memo
+// bytes). Anything else — cold memo, missing repo or issue, a query
+// string, an escaped or odd path, a wrong token — declines and the
+// request takes the normal path untouched.
+// ---------------------------------------------------------------------------
+
+func parseIssueURI(uri string) (owner, repo string, number int, ok bool) {
+	const p = "/api/v3/repos/"
+	if !strings.HasPrefix(uri, p) || strings.IndexByte(uri, '%') >= 0 {
+		return "", "", 0, false
+	}
+	rest := uri[len(p):]
+	i := strings.IndexByte(rest, '/')
+	if i <= 0 {
+		return "", "", 0, false
+	}
+	owner, rest = rest[:i], rest[i+1:]
+	i = strings.IndexByte(rest, '/')
+	if i <= 0 {
+		return "", "", 0, false
+	}
+	repo, rest = rest[:i], rest[i+1:]
+	if !strings.HasPrefix(rest, "issues/") {
+		return "", "", 0, false
+	}
+	numStr := rest[len("issues/"):]
+	if numStr == "" {
+		return "", "", 0, false
+	}
+	n := 0
+	for j := 0; j < len(numStr); j++ {
+		c := numStr[j]
+		if c < '0' || c > '9' {
+			return "", "", 0, false
+		}
+		n = n*10 + int(c-'0')
+		if n > 1<<30 {
+			return "", "", 0, false
+		}
+	}
+	return owner, repo, n, true
+}
+
+// tryFastIssue serves the request from the header block when it can.
+// handled=false means the normal path should take over (nothing was
+// written); when handled=true the response is fully written and err is
+// its write result.
+func (s *Server) tryFastIssue(conn net.Conn, rq *rawRequest) (bool, error) {
+	if rq.protoMinor != 1 || strings.IndexByte(rq.uri, '?') >= 0 {
+		return false, nil
+	}
+	if s.token != "" {
+		auth := rq.headers["Authorization"]
+		if len(auth) != 1 || auth[0] != "Bearer "+s.token {
+			return false, nil
+		}
+	}
+	owner, repoName, number, ok := parseIssueURI(rq.uri)
+	if !ok {
+		return false, nil
+	}
+	s.store.mu.RLock()
+	r := s.store.repo(owner, repoName)
+	var body []byte
+	if r != nil {
+		if iss := r.Issues[number]; iss != nil && iss.bodyCache != nil &&
+			iss.bodyCacheKey == issueBodyKey(r, iss) {
+			body = iss.bodyCache
+		}
+	}
+	s.store.mu.RUnlock()
+	if body == nil {
+		return false, nil
+	}
+	var head bytes.Buffer
+	head.Grow(192)
+	head.WriteString("HTTP/1.1 200 OK\r\n")
+	head.WriteString("Content-Type: application/json; charset=utf-8\r\n")
+	// the canonical key the normal path's http.Header.Set produces
+	head.WriteString("X-Github-Request-Id: ")
+	head.WriteString(s.store.requestID())
+	head.WriteString("\r\n")
+	head.WriteString("Date: ")
+	head.WriteString(cachedDate())
+	head.WriteString("\r\n")
+	head.WriteString("Content-Length: ")
+	head.WriteString(strconv.Itoa(len(body)))
+	head.WriteString("\r\n")
+	if rq.closeAfter {
+		head.WriteString("Connection: close\r\n")
+	}
+	head.WriteString("\r\n")
+	bufs := net.Buffers{head.Bytes(), body}
+	_, err := bufs.WriteTo(conn)
+	return true, err
 }
 
 // readHeaderBlock reads one header block (request line + headers + the
@@ -171,20 +287,67 @@ var rawMethods = map[string]bool{
 	"DELETE": true, "HEAD": true,
 }
 
+// eqFold reports whether b equals the (lowercase) string s under ASCII
+// case folding, without allocating.
+func eqFold(b []byte, s string) bool {
+	if len(b) != len(s) {
+		return false
+	}
+	for i := 0; i < len(b); i++ {
+		c := b[i]
+		if 'A' <= c && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if c != s[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func indexCRLF(b []byte) int {
+	for i := 0; i+1 < len(b); i++ {
+		if b[i] == '\r' && b[i+1] == '\n' {
+			return i
+		}
+	}
+	return -1
+}
+
 // parseRawRequest parses a header block. ok=false means "not modelled":
 // the caller hands the connection to the standard server untouched.
+//
+// The parse runs on the raw bytes: no whole-block string copy, and the
+// header map is populated with only the two headers any handler reads
+// (Authorization for the auth gate, Git-Protocol for info/refs) — every
+// other header is either interpreted inline (Host, Content-Length,
+// Transfer-Encoding, Expect, Connection) or ignored, exactly as the
+// handlers observe it.
 func parseRawRequest(hdr []byte) (*rawRequest, bool) {
-	text := string(hdr)
-	// request line
-	nl := strings.Index(text, "\r\n")
+	// request line: exactly two spaces, three parts (as strings.Split
+	// would count them)
+	nl := indexCRLF(hdr)
 	if nl < 0 {
 		return nil, false
 	}
-	parts := strings.Split(text[:nl], " ")
-	if len(parts) != 3 {
+	line := hdr[:nl]
+	sp1 := bytes.IndexByte(line, ' ')
+	if sp1 < 0 {
 		return nil, false
 	}
-	rq := &rawRequest{method: parts[0], uri: parts[1], proto: parts[2]}
+	sp2rel := bytes.IndexByte(line[sp1+1:], ' ')
+	if sp2rel < 0 {
+		return nil, false
+	}
+	sp2 := sp1 + 1 + sp2rel
+	if bytes.IndexByte(line[sp2+1:], ' ') >= 0 {
+		return nil, false
+	}
+	rq := &rawRequest{
+		method: string(line[:sp1]),
+		uri:    string(line[sp1+1 : sp2]),
+		proto:  string(line[sp2+1:]),
+	}
 	if !rawMethods[rq.method] {
 		return nil, false
 	}
@@ -198,51 +361,60 @@ func parseRawRequest(hdr []byte) (*rawRequest, bool) {
 		return nil, false
 	}
 	rq.headers = http.Header{}
-	rest := text[nl+2:]
+	rest := hdr[nl+2:]
 	for len(rest) > 0 {
-		end := strings.Index(rest, "\r\n")
+		end := indexCRLF(rest)
 		if end < 0 {
 			return nil, false
 		}
-		line := rest[:end]
+		hline := rest[:end]
 		rest = rest[end+2:]
-		if line == "" {
+		if len(hline) == 0 {
 			break
 		}
-		colon := strings.IndexByte(line, ':')
+		colon := bytes.IndexByte(hline, ':')
 		if colon <= 0 {
 			return nil, false
 		}
-		name := line[:colon]
-		value := strings.TrimSpace(line[colon+1:])
-		switch strings.ToLower(name) {
-		case "host":
-			rq.host = value
-		case "content-length":
-			n, err := strconv.ParseInt(value, 10, 64)
-			if err != nil || n < 0 || (rq.hasLen && rq.contentLength != n) {
+		name := hline[:colon]
+		value := bytes.TrimSpace(hline[colon+1:])
+		switch {
+		case eqFold(name, "host"):
+			rq.host = string(value)
+		case eqFold(name, "content-length"):
+			n, ok := parseContentLength(value)
+			if !ok || (rq.hasLen && rq.contentLength != n) {
 				return nil, false
 			}
 			rq.hasLen = true
 			rq.contentLength = n
-		case "transfer-encoding":
-			if strings.ToLower(value) != "identity" {
+		case eqFold(name, "transfer-encoding"):
+			if !eqFold(value, "identity") {
 				return nil, false // chunked or other codings: not modelled
 			}
-		case "expect":
+		case eqFold(name, "expect"):
 			return nil, false // 100-continue negotiation: not modelled
-		case "connection":
-			for _, tok := range strings.Split(strings.ToLower(value), ",") {
-				switch strings.TrimSpace(tok) {
-				case "close":
+		case eqFold(name, "connection"):
+			for len(value) > 0 {
+				var tok []byte
+				if i := bytes.IndexByte(value, ','); i >= 0 {
+					tok, value = value[:i], value[i+1:]
+				} else {
+					tok, value = value, nil
+				}
+				tok = bytes.TrimSpace(tok)
+				switch {
+				case eqFold(tok, "close"):
 					rq.closeAfter = true
-				case "keep-alive":
+				case eqFold(tok, "keep-alive"):
 					rq.closeAfter = false
 				}
 			}
+		case eqFold(name, "authorization"):
+			rq.headers["Authorization"] = append(rq.headers["Authorization"], string(value))
+		case eqFold(name, "git-protocol"):
+			rq.headers["Git-Protocol"] = append(rq.headers["Git-Protocol"], string(value))
 		}
-		key := textproto.CanonicalMIMEHeaderKey(name)
-		rq.headers[key] = append(rq.headers[key], value)
 	}
 	if rq.host == "" && rq.protoMinor == 1 {
 		// HTTP/1.1 requires a Host header; net/http would 400 it. Keep the
@@ -250,6 +422,25 @@ func parseRawRequest(hdr []byte) (*rawRequest, bool) {
 		return nil, false
 	}
 	return rq, true
+}
+
+// parseContentLength parses a decimal Content-Length value (digits only;
+// anything fancier is left to the standard server via fallback).
+func parseContentLength(b []byte) (int64, bool) {
+	if len(b) == 0 {
+		return 0, false
+	}
+	var n int64
+	for _, c := range b {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		n = n*10 + int64(c-'0')
+		if n > 1<<62 {
+			return 0, false
+		}
+	}
+	return n, true
 }
 
 // ---------------------------------------------------------------------------

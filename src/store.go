@@ -123,13 +123,34 @@ func (s *Store) tick() int64 {
 	return clockBase + s.clock
 }
 
+// formatTime renders the GitHub timestamp for a logical-clock epoch.
+// The distinct epochs in a run are few and reads repeat the same one
+// thousands of times, so the last rendering is memoised (the epoch is
+// checked on every hit, and a lost store just recomputes).
+var fmtTimeEpoch atomic.Int64
+var fmtTimeStr atomic.Value // string
+
 func formatTime(epoch int64) string {
-	return time.Unix(epoch, 0).UTC().Format("2006-01-02T15:04:05Z")
+	if fmtTimeEpoch.Load() == epoch {
+		if v := fmtTimeStr.Load(); v != nil {
+			return v.(string)
+		}
+	}
+	str := time.Unix(epoch, 0).UTC().Format("2006-01-02T15:04:05Z")
+	fmtTimeStr.Store(str)
+	fmtTimeEpoch.Store(epoch)
+	return str
 }
 
 func (s *Store) requestID() string {
 	n := atomic.AddInt64(&s.reqSeq, 1)
-	return fmt.Sprintf("%016x", n*2654435761%(1<<48))
+	v := uint64(n) * 2654435761 % (1 << 48)
+	var buf [16]byte
+	for i := 15; i >= 0; i-- {
+		buf[i] = "0123456789abcdef"[v&0xf]
+		v >>= 4
+	}
+	return string(buf[:])
 }
 
 func (s *Store) createRepo(owner, name, description string, private bool) *Repo {

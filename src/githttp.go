@@ -19,9 +19,15 @@ const zeroOID = "0000000000000000000000000000000000000000"
 // pkt-lines
 // ---------------------------------------------------------------------------
 
+const hexDigits = "0123456789abcdef"
+
 func pktLine(payload string) []byte {
 	n := len(payload) + 4
-	return []byte(fmt.Sprintf("%04x%s", n, payload))
+	out := make([]byte, 0, n)
+	out = append(out, hexDigits[(n>>12)&0xf], hexDigits[(n>>8)&0xf],
+		hexDigits[(n>>4)&0xf], hexDigits[n&0xf])
+	out = append(out, payload...)
+	return out
 }
 
 func pktFlush() []byte { return []byte("0000") }
@@ -468,7 +474,9 @@ func sidebandChunks(buf *bytes.Buffer, pack []byte) {
 		chunk = append(chunk, 1)
 		chunk = append(chunk, pack[:n]...)
 		pack = pack[n:]
-		buf.Write([]byte(fmt.Sprintf("%04x", len(chunk)+4)))
+		m := len(chunk) + 4
+		buf.Write([]byte{hexDigits[(m>>12)&0xf], hexDigits[(m>>8)&0xf],
+			hexDigits[(m>>4)&0xf], hexDigits[m&0xf]})
 		buf.Write(chunk)
 	}
 }
